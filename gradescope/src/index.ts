@@ -354,11 +354,18 @@ const solutionGenerator = new SolutionGenerator();
 const workflowOrchestrator = new WorkflowOrchestrator();
 
 async function autoLogin() {
+  // Auto-login to Gradescope
   const sessionCookie = process.env.GRADESCOPE_SESSION;
   const signedToken = process.env.GRADESCOPE_TOKEN;
   if (sessionCookie && signedToken) {
     const cookieString = `_gradescope_session=${sessionCookie}; signed_token=${signedToken}`;
     await gradescopeClient.loginWithCookies(cookieString);
+  }
+
+  // Auto-login to Canvas
+  const canvasToken = process.env.CANVAS_API_TOKEN;
+  if (canvasToken) {
+    await canvasClient.login(canvasToken);
   }
 }
 
