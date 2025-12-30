@@ -290,6 +290,104 @@ class GradescopeClient {
     return grades;
   }
 
+  async getSubmissions(
+    courseId: string,
+    assignmentId: string
+  ): Promise<{
+    submissions: Array<{
+      id: string;
+      submittedAt: string;
+      score: string;
+      status: string;
+      isLatest: boolean;
+    }>;
+    assignmentName: string;
+    hasSubmission: boolean;
+  }> {
+    if (!this.loggedIn) throw new Error("Not logged in");
+
+    const submissionsUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
+    const response = await fetch(submissionsUrl, {
+      headers: { Cookie: this.getCookieHeader() },
+    });
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    const submissions: Array<{
+      id: string;
+      submittedAt: string;
+      score: string;
+      status: string;
+      isLatest: boolean;
+    }> = [];
+
+    // Get assignment name from the page
+    const assignmentName = $("h1, .assignment-title, .assignmentTitle").first().text().trim() || "Unknown Assignment";
+
+    // Parse submission history table
+    $(".submissionHistoryTable tr, table.table tbody tr, .submission-history tr").each((index, row) => {
+      const $row = $(row);
+
+      // Skip header rows
+      if ($row.find("th").length > 0) return;
+
+      const $link = $row.find("a").first();
+      const href = $link.attr("href") || "";
+      const idMatch = href.match(/\/submissions\/(\d+)/);
+      const id = idMatch ? idMatch[1] : "";
+
+      if (!id) return;
+
+      // Get submission time
+      const timeElem = $row.find("time");
+      const submittedAt = timeElem.attr("datetime") || timeElem.text().trim() || $row.find("td").eq(0).text().trim();
+
+      // Get score
+      const scoreText = $row.find(".score, .submissionScore, td:contains('/')").text().trim();
+      const score = scoreText.match(/[\d.]+\s*\/\s*[\d.]+/) ? scoreText : "";
+
+      // Get status
+      let status = "";
+      $row.find("td").each((_, cell) => {
+        const text = $(cell).text().trim();
+        if (text.includes("Graded") || text.includes("Submitted") || text.includes("Processing") || text.includes("Pending")) {
+          status = text;
+        }
+      });
+
+      // First submission in the list is typically the latest
+      submissions.push({
+        id,
+        submittedAt,
+        score,
+        status: status || "Submitted",
+        isLatest: index === 0,
+      });
+    });
+
+    // Also check for single submission display (some assignments show just one)
+    if (submissions.length === 0) {
+      const singleSubmissionLink = $("a[href*='/submissions/']").first();
+      const href = singleSubmissionLink.attr("href") || "";
+      const idMatch = href.match(/\/submissions\/(\d+)/);
+      if (idMatch) {
+        submissions.push({
+          id: idMatch[1],
+          submittedAt: $("time").first().text().trim() || "Unknown",
+          score: $(".score").first().text().trim() || "",
+          status: "Submitted",
+          isLatest: true,
+        });
+      }
+    }
+
+    return {
+      submissions,
+      assignmentName,
+      hasSubmission: submissions.length > 0,
+    };
+  }
+
   async uploadSubmission(
     courseId: string,
     assignmentId: string,
@@ -304,14 +402,37 @@ class GradescopeClient {
     }
 
     const courseUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}`;
-    const uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
+    const assignmentUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}`;
 
-    const tokenResponse = await fetch(courseUrl, {
+    // First, check the assignment page to get CSRF token and detect existing submission
+    const assignmentResponse = await fetch(assignmentUrl, {
       headers: { Cookie: this.getCookieHeader() },
+      redirect: "follow",
     });
-    const tokenHtml = await tokenResponse.text();
-    const $ = cheerio.load(tokenHtml);
+    const assignmentHtml = await assignmentResponse.text();
+    const $ = cheerio.load(assignmentHtml);
     const authToken = $('meta[name="csrf-token"]').attr("content") || "";
+
+    // Check if there's an existing submission by looking at the final URL or form action
+    // When you have a submission, you get redirected to /submissions/{id}
+    const finalAssignmentUrl = assignmentResponse.url;
+    const existingSubmissionMatch = finalAssignmentUrl.match(/\/submissions\/(\d+)/);
+
+    // Also check for form action in the modal (for programming assignments)
+    let uploadUrl: string;
+    const formAction = $('form.js-submitCodeForm').attr('action') ||
+                       $('form[action*="submissions"]').attr('action');
+
+    if (formAction && formAction.includes('/submissions/')) {
+      // Use the form action URL (has the submission ID for resubmission)
+      uploadUrl = formAction.startsWith('http') ? formAction : `${GRADESCOPE_BASE_URL}${formAction}`;
+    } else if (existingSubmissionMatch) {
+      // Resubmit to existing submission
+      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions/${existingSubmissionMatch[1]}`;
+    } else {
+      // New submission
+      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
+    }
 
     const form = new FormData();
     form.append("utf8", "✓");
@@ -346,7 +467,7 @@ class GradescopeClient {
       method: "POST",
       headers: {
         Cookie: this.getCookieHeader(),
-        Referer: courseUrl,
+        Referer: assignmentUrl,
         ...form.getHeaders(),
       },
       body: form as unknown as BodyInit,
@@ -476,6 +597,47 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
               required: ["filename", "content"],
             },
             description: "Array of files with filename and content to upload directly (use this when you have the file content but not a local path)",
+          },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "gradescope_get_submissions",
+      description: "Get submission history for a Gradescope assignment. Shows all past submissions with their timestamps, scores, and statuses.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "string", description: "The course ID" },
+          assignment_id: { type: "string", description: "The assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "gradescope_resubmit",
+      description: "Resubmit to a Gradescope assignment that already has a previous submission. This will create a new submission while preserving the submission history. Returns information about previous submissions before uploading the new one.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "string", description: "The course ID" },
+          assignment_id: { type: "string", description: "The assignment ID" },
+          file_paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of absolute file paths on the local filesystem to upload",
+          },
+          file_contents: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                filename: { type: "string", description: "The filename (e.g., 'submission.txt')" },
+                content: { type: "string", description: "The file content as a string" },
+              },
+              required: ["filename", "content"],
+            },
+            description: "Array of files with filename and content to upload directly",
           },
         },
         required: ["course_id", "assignment_id"],
@@ -830,6 +992,92 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "gradescope_get_submissions": {
+        const { course_id, assignment_id } = args as {
+          course_id: string;
+          assignment_id: string;
+        };
+        const result = await gradescopeClient.getSubmissions(course_id, assignment_id);
+
+        if (result.submissions.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No submissions found for assignment: ${result.assignmentName}\n\nUse gradescope_upload_submission to submit for the first time.`,
+            }],
+          };
+        }
+
+        let response = `Submission History for: ${result.assignmentName}\n`;
+        response += `Total submissions: ${result.submissions.length}\n\n`;
+
+        result.submissions.forEach((sub, index) => {
+          response += `${index + 1}. ${sub.isLatest ? "[LATEST] " : ""}Submission #${sub.id}\n`;
+          response += `   Submitted: ${sub.submittedAt}\n`;
+          response += `   Status: ${sub.status}\n`;
+          if (sub.score) {
+            response += `   Score: ${sub.score}\n`;
+          }
+          response += "\n";
+        });
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "gradescope_resubmit": {
+        const { course_id, assignment_id, file_paths, file_contents } = args as {
+          course_id: string;
+          assignment_id: string;
+          file_paths?: string[];
+          file_contents?: Array<{ filename: string; content: string }>;
+        };
+
+        // First, get existing submissions
+        const existingSubmissions = await gradescopeClient.getSubmissions(course_id, assignment_id);
+
+        let response = "";
+
+        if (existingSubmissions.hasSubmission) {
+          response += `Previous submissions found for: ${existingSubmissions.assignmentName}\n`;
+          response += `Number of previous submissions: ${existingSubmissions.submissions.length}\n`;
+
+          const latest = existingSubmissions.submissions.find(s => s.isLatest);
+          if (latest) {
+            response += `Latest submission: #${latest.id} at ${latest.submittedAt}`;
+            if (latest.score) {
+              response += ` (Score: ${latest.score})`;
+            }
+            response += "\n";
+          }
+          response += "\n--- Uploading new submission ---\n\n";
+        } else {
+          response += `No previous submissions found for: ${existingSubmissions.assignmentName}\n`;
+          response += "This will be your first submission.\n\n";
+        }
+
+        // Now upload the new submission
+        const uploadResult = await gradescopeClient.uploadSubmission(
+          course_id,
+          assignment_id,
+          file_paths,
+          file_contents
+        );
+
+        if (uploadResult.success) {
+          response += `Resubmission successful!\n`;
+          response += `New submission URL: ${uploadResult.url}\n`;
+          response += `\nYour previous ${existingSubmissions.submissions.length} submission(s) are preserved in the history.`;
+        } else {
+          response += `Resubmission failed: ${uploadResult.error}`;
+        }
+
+        return {
+          content: [{ type: "text", text: response }],
         };
       }
 
