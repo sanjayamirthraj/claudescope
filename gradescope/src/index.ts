@@ -11,27 +11,20 @@ import FormData from "form-data";
 import fs from "fs";
 import path from "path";
 
+// Import Canvas module
+import {
+  CanvasClient,
+  CourseMapper,
+  CanvasCourse,
+  GradescopeCourse,
+  GradescopeAssignment,
+} from "./canvas/index.js";
+
 const GRADESCOPE_BASE_URL = "https://www.gradescope.com";
 
 interface Cookie {
   name: string;
   value: string;
-}
-
-interface Course {
-  id: string;
-  name: string;
-  shortName: string;
-  term: string;
-  role: string;
-}
-
-interface Assignment {
-  id: string;
-  name: string;
-  dueDate: string;
-  status: string;
-  score: string;
 }
 
 class GradescopeClient {
@@ -129,7 +122,11 @@ class GradescopeClient {
     return false;
   }
 
-  async getCourses(): Promise<{ instructor: Course[]; student: Course[] }> {
+  isLoggedIn(): boolean {
+    return this.loggedIn;
+  }
+
+  async getCourses(): Promise<{ instructor: GradescopeCourse[]; student: GradescopeCourse[] }> {
     if (!this.loggedIn) throw new Error("Not logged in");
 
     const response = await fetch(`${GRADESCOPE_BASE_URL}/account`, {
@@ -138,7 +135,7 @@ class GradescopeClient {
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    const courses: { instructor: Course[]; student: Course[] } = {
+    const courses: { instructor: GradescopeCourse[]; student: GradescopeCourse[] } = {
       instructor: [],
       student: [],
     };
@@ -169,7 +166,7 @@ class GradescopeClient {
     return courses;
   }
 
-  async getAssignments(courseId: string): Promise<Assignment[]> {
+  async getAssignments(courseId: string): Promise<GradescopeAssignment[]> {
     if (!this.loggedIn) throw new Error("Not logged in");
 
     const response = await fetch(
@@ -179,7 +176,7 @@ class GradescopeClient {
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    const assignments: Assignment[] = [];
+    const assignments: GradescopeAssignment[] = [];
 
     $("table.table tbody tr").each((_, row) => {
       const $row = $(row);
@@ -291,7 +288,10 @@ class GradescopeClient {
   }
 }
 
-const client = new GradescopeClient();
+// Initialize clients
+const gradescopeClient = new GradescopeClient();
+const canvasClient = new CanvasClient();
+const courseMapper = new CourseMapper();
 
 async function autoLogin() {
   const sessionCookie = process.env.GRADESCOPE_SESSION;
@@ -309,6 +309,7 @@ const server = new Server(
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    // Gradescope tools
     {
       name: "gradescope_login",
       description: "Login to Gradescope with email and password",
@@ -370,6 +371,101 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["course_id", "assignment_id", "file_paths"],
       },
     },
+    // Canvas tools
+    {
+      name: "canvas_login",
+      description: "Login to Canvas LMS with an API access token",
+      inputSchema: {
+        type: "object",
+        properties: {
+          api_token: { type: "string", description: "Canvas API access token" },
+        },
+        required: ["api_token"],
+      },
+    },
+    {
+      name: "canvas_get_courses",
+      description: "Get all active courses for the logged in Canvas user",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "canvas_get_assignments",
+      description: "Get all assignments for a specific Canvas course",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+        },
+        required: ["course_id"],
+      },
+    },
+    {
+      name: "canvas_get_assignment",
+      description: "Get detailed information about a specific Canvas assignment including its description",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    // Course mapping tools
+    {
+      name: "auto_match_courses",
+      description: "Automatically match Canvas courses to Gradescope courses by name similarity. Requires both Canvas and Gradescope to be logged in.",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "get_course_mappings",
+      description: "Get all current course mappings between Canvas and Gradescope",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "exclude_course",
+      description: "Exclude a Canvas course from automatic assignment processing",
+      inputSchema: {
+        type: "object",
+        properties: {
+          canvas_course_id: { type: "number", description: "The Canvas course ID to exclude" },
+        },
+        required: ["canvas_course_id"],
+      },
+    },
+    {
+      name: "include_course",
+      description: "Re-include a previously excluded Canvas course",
+      inputSchema: {
+        type: "object",
+        properties: {
+          canvas_course_id: { type: "number", description: "The Canvas course ID to include" },
+        },
+        required: ["canvas_course_id"],
+      },
+    },
+    {
+      name: "auto_match_assignments",
+      description: "Automatically match Canvas assignments to Gradescope assignments for a specific course",
+      inputSchema: {
+        type: "object",
+        properties: {
+          canvas_course_id: { type: "number", description: "The Canvas course ID" },
+        },
+        required: ["canvas_course_id"],
+      },
+    },
+    {
+      name: "get_assignment_mappings",
+      description: "Get assignment mappings for a specific Canvas course",
+      inputSchema: {
+        type: "object",
+        properties: {
+          canvas_course_id: { type: "number", description: "The Canvas course ID" },
+        },
+        required: ["canvas_course_id"],
+      },
+    },
   ],
 }));
 
@@ -378,9 +474,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      // Gradescope handlers
       case "gradescope_login": {
         const { email, password } = args as { email: string; password: string };
-        const success = await client.login(email, password);
+        const success = await gradescopeClient.login(email, password);
         return {
           content: [
             {
@@ -409,7 +506,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "gradescope_get_courses": {
-        const courses = await client.getCourses();
+        const courses = await gradescopeClient.getCourses();
         return {
           content: [{ type: "text", text: JSON.stringify(courses, null, 2) }],
         };
@@ -417,7 +514,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "gradescope_get_assignments": {
         const { course_id } = args as { course_id: string };
-        const assignments = await client.getAssignments(course_id);
+        const assignments = await gradescopeClient.getAssignments(course_id);
         return {
           content: [
             { type: "text", text: JSON.stringify(assignments, null, 2) },
@@ -431,13 +528,191 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           assignment_id: string;
           file_paths: string[];
         };
-        const result = await client.uploadSubmission(
+        const result = await gradescopeClient.uploadSubmission(
           course_id,
           assignment_id,
           file_paths
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      // Canvas handlers
+      case "canvas_login": {
+        const { api_token } = args as { api_token: string };
+        const success = await canvasClient.login(api_token);
+        return {
+          content: [
+            {
+              type: "text",
+              text: success
+                ? "Successfully logged in to Canvas"
+                : "Login failed - check your API token",
+            },
+          ],
+        };
+      }
+
+      case "canvas_get_courses": {
+        const courses = await canvasClient.getCourses();
+        return {
+          content: [{ type: "text", text: JSON.stringify(courses, null, 2) }],
+        };
+      }
+
+      case "canvas_get_assignments": {
+        const { course_id } = args as { course_id: number };
+        const assignments = await canvasClient.getAssignments(course_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(assignments, null, 2) }],
+        };
+      }
+
+      case "canvas_get_assignment": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+        const assignment = await canvasClient.getAssignment(course_id, assignment_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(assignment, null, 2) }],
+        };
+      }
+
+      // Course mapping handlers
+      case "auto_match_courses": {
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas" }],
+          };
+        }
+        if (!gradescopeClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Gradescope" }],
+          };
+        }
+
+        const canvasCourses = await canvasClient.getCourses();
+        const gradescopeCourses = await gradescopeClient.getCourses();
+        const allGsCourses = [
+          ...gradescopeCourses.instructor,
+          ...gradescopeCourses.student,
+        ];
+
+        const result = courseMapper.autoMatchCourses(canvasCourses, allGsCourses);
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  matched: result.matched.length,
+                  unmatched: result.unmatched.length,
+                  mappings: result.matched,
+                  unmatchedCourses: result.unmatched.map((c) => ({
+                    id: c.id,
+                    name: c.name,
+                  })),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "get_course_mappings": {
+        const mappings = courseMapper.getCourseMappings();
+        return {
+          content: [{ type: "text", text: JSON.stringify(mappings, null, 2) }],
+        };
+      }
+
+      case "exclude_course": {
+        const { canvas_course_id } = args as { canvas_course_id: number };
+        const success = courseMapper.excludeCourse(canvas_course_id);
+        return {
+          content: [
+            {
+              type: "text",
+              text: success
+                ? `Course ${canvas_course_id} excluded from automation`
+                : `Course ${canvas_course_id} not found in mappings`,
+            },
+          ],
+        };
+      }
+
+      case "include_course": {
+        const { canvas_course_id } = args as { canvas_course_id: number };
+        const success = courseMapper.includeCourse(canvas_course_id);
+        return {
+          content: [
+            {
+              type: "text",
+              text: success
+                ? `Course ${canvas_course_id} included in automation`
+                : `Course ${canvas_course_id} not found in mappings`,
+            },
+          ],
+        };
+      }
+
+      case "auto_match_assignments": {
+        const { canvas_course_id } = args as { canvas_course_id: number };
+
+        const mapping = courseMapper.getMappingForCanvasCourse(canvas_course_id);
+        if (!mapping) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No course mapping found for Canvas course ${canvas_course_id}. Run auto_match_courses first.`,
+              },
+            ],
+          };
+        }
+
+        const canvasAssignments = await canvasClient.getAssignments(canvas_course_id);
+        const gsAssignments = await gradescopeClient.getAssignments(
+          mapping.gradescopeCourseId
+        );
+
+        const result = courseMapper.autoMatchAssignments(
+          canvas_course_id,
+          canvasAssignments,
+          gsAssignments
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  matched: result.matched.length,
+                  unmatched: result.unmatched.length,
+                  mappings: result.matched,
+                  unmatchedAssignments: result.unmatched.map((a) => ({
+                    id: a.id,
+                    name: a.name,
+                  })),
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      case "get_assignment_mappings": {
+        const { canvas_course_id } = args as { canvas_course_id: number };
+        const mappings = courseMapper.getAssignmentMappings(canvas_course_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(mappings, null, 2) }],
         };
       }
 
