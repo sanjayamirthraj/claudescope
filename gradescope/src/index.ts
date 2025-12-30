@@ -293,9 +293,15 @@ class GradescopeClient {
   async uploadSubmission(
     courseId: string,
     assignmentId: string,
-    filePaths: string[]
+    filePaths?: string[],
+    fileContents?: Array<{ filename: string; content: string }>
   ): Promise<{ success: boolean; url?: string; error?: string }> {
     if (!this.loggedIn) throw new Error("Not logged in");
+
+    // Must provide either file paths or file contents
+    if ((!filePaths || filePaths.length === 0) && (!fileContents || fileContents.length === 0)) {
+      return { success: false, error: "Must provide either file_paths or file_contents" };
+    }
 
     const courseUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}`;
     const uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
@@ -312,14 +318,28 @@ class GradescopeClient {
     form.append("authenticity_token", authToken);
     form.append("submission[method]", "upload");
 
-    for (const filePath of filePaths) {
-      const absolutePath = path.resolve(filePath);
-      if (!fs.existsSync(absolutePath)) {
-        return { success: false, error: `File not found: ${filePath}` };
+    // Handle file paths (files on local filesystem)
+    if (filePaths && filePaths.length > 0) {
+      for (const filePath of filePaths) {
+        const absolutePath = path.resolve(filePath);
+        if (!fs.existsSync(absolutePath)) {
+          return { success: false, error: `File not found: ${filePath}` };
+        }
+        const fileStream = fs.createReadStream(absolutePath);
+        const fileName = path.basename(absolutePath);
+        form.append("submission[files][]", fileStream, fileName);
       }
-      const fileStream = fs.createReadStream(absolutePath);
-      const fileName = path.basename(absolutePath);
-      form.append("submission[files][]", fileStream, fileName);
+    }
+
+    // Handle direct file contents (for files uploaded to Claude or provided as text)
+    if (fileContents && fileContents.length > 0) {
+      for (const file of fileContents) {
+        const buffer = Buffer.from(file.content, "utf-8");
+        form.append("submission[files][]", buffer, {
+          filename: file.filename,
+          contentType: "application/octet-stream",
+        });
+      }
     }
 
     const response = await fetch(uploadUrl, {
@@ -434,7 +454,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "gradescope_upload_submission",
-      description: "Upload files to a Gradescope assignment",
+      description: "Upload files to a Gradescope assignment. Provide either file_paths (for local files) or file_contents (for direct content upload).",
       inputSchema: {
         type: "object",
         properties: {
@@ -443,10 +463,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           file_paths: {
             type: "array",
             items: { type: "string" },
-            description: "Array of file paths to upload",
+            description: "Array of absolute file paths on the local filesystem to upload",
+          },
+          file_contents: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                filename: { type: "string", description: "The filename (e.g., 'submission.txt')" },
+                content: { type: "string", description: "The file content as a string" },
+              },
+              required: ["filename", "content"],
+            },
+            description: "Array of files with filename and content to upload directly (use this when you have the file content but not a local path)",
           },
         },
-        required: ["course_id", "assignment_id", "file_paths"],
+        required: ["course_id", "assignment_id"],
       },
     },
     // Canvas tools
@@ -784,15 +816,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "gradescope_upload_submission": {
-        const { course_id, assignment_id, file_paths } = args as {
+        const { course_id, assignment_id, file_paths, file_contents } = args as {
           course_id: string;
           assignment_id: string;
-          file_paths: string[];
+          file_paths?: string[];
+          file_contents?: Array<{ filename: string; content: string }>;
         };
         const result = await gradescopeClient.uploadSubmission(
           course_id,
           assignment_id,
-          file_paths
+          file_paths,
+          file_contents
         );
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
