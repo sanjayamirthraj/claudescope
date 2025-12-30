@@ -16,9 +16,11 @@ import {
   CanvasClient,
   CourseMapper,
   AssignmentAnalyzer,
+  SolutionGenerator,
   CanvasCourse,
   GradescopeCourse,
   GradescopeAssignment,
+  SolutionFormat,
 } from "./canvas/index.js";
 
 const GRADESCOPE_BASE_URL = "https://www.gradescope.com";
@@ -294,6 +296,7 @@ const gradescopeClient = new GradescopeClient();
 const canvasClient = new CanvasClient();
 const courseMapper = new CourseMapper();
 const assignmentAnalyzer = new AssignmentAnalyzer();
+const solutionGenerator = new SolutionGenerator();
 
 async function autoLogin() {
   const sessionCookie = process.env.GRADESCOPE_SESSION;
@@ -490,6 +493,86 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           course_id: { type: "number", description: "The Canvas course ID" },
         },
         required: ["course_id"],
+      },
+    },
+    // Solution generator tools
+    {
+      name: "prepare_solution",
+      description: "Prepare context and instructions for generating a solution to a Canvas assignment. Returns a prompt that can be used to generate the solution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "save_draft",
+      description: "Save a generated solution as a draft for review before submission",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+          content: { type: "string", description: "The solution content" },
+        },
+        required: ["course_id", "assignment_id", "content"],
+      },
+    },
+    {
+      name: "get_draft",
+      description: "Get a saved draft for an assignment",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "list_drafts",
+      description: "List all saved drafts",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "update_draft",
+      description: "Update the content of an existing draft",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+          content: { type: "string", description: "The updated solution content" },
+        },
+        required: ["course_id", "assignment_id", "content"],
+      },
+    },
+    {
+      name: "approve_draft",
+      description: "Mark a draft as approved and ready for submission",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "delete_draft",
+      description: "Delete a saved draft",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
       },
     },
   ],
@@ -802,6 +885,213 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: summary,
+            },
+          ],
+        };
+      }
+
+      // Solution generator handlers
+      case "prepare_solution": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas" }],
+          };
+        }
+
+        const assignment = await canvasClient.getAssignment(course_id, assignment_id);
+        const analysis = assignmentAnalyzer.analyze(assignment, course_id);
+
+        if (!analysis.automatable) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `This assignment cannot be automated: ${analysis.automatableReason}`,
+              },
+            ],
+          };
+        }
+
+        const context = solutionGenerator.prepareContext(analysis);
+        const prompt = solutionGenerator.generatePrompt(context);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: prompt,
+            },
+          ],
+        };
+      }
+
+      case "save_draft": {
+        const { course_id, assignment_id, content } = args as {
+          course_id: number;
+          assignment_id: number;
+          content: string;
+        };
+
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas" }],
+          };
+        }
+
+        const assignment = await canvasClient.getAssignment(course_id, assignment_id);
+        const analysis = assignmentAnalyzer.analyze(assignment, course_id);
+        const context = solutionGenerator.prepareContext(analysis);
+
+        const draft = solutionGenerator.saveDraft(
+          assignment_id,
+          course_id,
+          assignment.name,
+          content,
+          context.format
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Draft saved successfully!\n\n${solutionGenerator.formatForReview(draft)}`,
+            },
+          ],
+        };
+      }
+
+      case "get_draft": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+
+        const draft = solutionGenerator.getDraft(course_id, assignment_id);
+
+        if (!draft) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No draft found for assignment ${assignment_id} in course ${course_id}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: solutionGenerator.formatForReview(draft),
+            },
+          ],
+        };
+      }
+
+      case "list_drafts": {
+        const drafts = solutionGenerator.getAllDrafts();
+
+        if (drafts.length === 0) {
+          return {
+            content: [{ type: "text", text: "No drafts saved" }],
+          };
+        }
+
+        const summary = drafts.map((d) => {
+          const wordCount = d.content.split(/\s+/).filter((w) => w.length > 0).length;
+          return `• ${d.assignmentName} [${d.status}] - ${wordCount} words - Updated: ${d.updatedAt.toLocaleString()}`;
+        }).join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Saved Drafts (${drafts.length}) ===\n\n${summary}`,
+            },
+          ],
+        };
+      }
+
+      case "update_draft": {
+        const { course_id, assignment_id, content } = args as {
+          course_id: number;
+          assignment_id: number;
+          content: string;
+        };
+
+        const draft = solutionGenerator.updateDraftContent(course_id, assignment_id, content);
+
+        if (!draft) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No draft found for assignment ${assignment_id} in course ${course_id}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Draft updated!\n\n${solutionGenerator.formatForReview(draft)}`,
+            },
+          ],
+        };
+      }
+
+      case "approve_draft": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+
+        const draft = solutionGenerator.updateDraftStatus(course_id, assignment_id, "approved");
+
+        if (!draft) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No draft found for assignment ${assignment_id} in course ${course_id}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Draft approved and ready for submission!\n\nAssignment: ${draft.assignmentName}\nStatus: ${draft.status}\n\nUse gradescope_upload_submission to submit this assignment.`,
+            },
+          ],
+        };
+      }
+
+      case "delete_draft": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+
+        const deleted = solutionGenerator.deleteDraft(course_id, assignment_id);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: deleted
+                ? `Draft deleted successfully`
+                : `No draft found for assignment ${assignment_id} in course ${course_id}`,
             },
           ],
         };
