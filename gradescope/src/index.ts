@@ -17,6 +17,7 @@ import {
   CourseMapper,
   AssignmentAnalyzer,
   SolutionGenerator,
+  WorkflowOrchestrator,
   CanvasCourse,
   GradescopeCourse,
   GradescopeAssignment,
@@ -350,6 +351,7 @@ const canvasClient = new CanvasClient();
 const courseMapper = new CourseMapper();
 const assignmentAnalyzer = new AssignmentAnalyzer();
 const solutionGenerator = new SolutionGenerator();
+const workflowOrchestrator = new WorkflowOrchestrator();
 
 async function autoLogin() {
   const sessionCookie = process.env.GRADESCOPE_SESSION;
@@ -637,6 +639,77 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           assignment_id: { type: "number", description: "The Canvas assignment ID" },
         },
         required: ["course_id", "assignment_id"],
+      },
+    },
+    // Workflow tools
+    {
+      name: "start_assignment",
+      description: "Start working on an assignment using natural language. Example: 'hw 17 from cs 170' or 'lab 3 from data structures'. Returns a prompt for generating the solution.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          request: {
+            type: "string",
+            description: "Natural language description of the assignment, e.g., 'hw 17 from cs 170' or 'complete lab 3 for eecs 16a'",
+          },
+        },
+        required: ["request"],
+      },
+    },
+    {
+      name: "save_and_review",
+      description: "Save the generated solution and prepare it for review. Call this after generating the solution content.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The workflow session ID" },
+          content: { type: "string", description: "The generated solution content" },
+        },
+        required: ["session_id", "content"],
+      },
+    },
+    {
+      name: "submit_assignment",
+      description: "Submit an approved assignment to Gradescope. Only works after the draft has been reviewed and approved.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The workflow session ID" },
+          file_path: { type: "string", description: "Optional: Path to save content as file before uploading (for code submissions)" },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "get_workflow_status",
+      description: "Get the status and details of a workflow session",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The workflow session ID" },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "list_workflows",
+      description: "List all workflow sessions, optionally filtering by status",
+      inputSchema: {
+        type: "object",
+        properties: {
+          active_only: { type: "boolean", description: "If true, only show active (in_progress or awaiting_review) sessions" },
+        },
+      },
+    },
+    {
+      name: "get_workflow_documentation",
+      description: "Get full documentation/report for a completed workflow session",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "The workflow session ID" },
+        },
+        required: ["session_id"],
       },
     },
   ],
@@ -1166,6 +1239,298 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 : `No draft found for assignment ${assignment_id} in course ${course_id}`,
             },
           ],
+        };
+      }
+
+      // Workflow handlers
+      case "start_assignment": {
+        const { request } = args as { request: string };
+
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas. Use canvas_login first." }],
+          };
+        }
+
+        // Create workflow session
+        const session = workflowOrchestrator.createSession(request);
+
+        // Parse the request to extract course and assignment
+        // Expected formats: "hw 17 from cs 170", "complete lab 3 for eecs 16a", "cs 170 hw 17"
+        const fromMatch = request.match(/(.+?)\s+(?:from|for|in)\s+(.+)/i);
+        const reverseMatch = request.match(/^([a-z]+\s*\d+[a-z]?)\s+(.+)/i);
+
+        let courseQuery: string;
+        let assignmentQuery: string;
+
+        if (fromMatch) {
+          assignmentQuery = fromMatch[1].replace(/^complete\s+/i, "").trim();
+          courseQuery = fromMatch[2].trim();
+        } else if (reverseMatch) {
+          courseQuery = reverseMatch[1].trim();
+          assignmentQuery = reverseMatch[2].trim();
+        } else {
+          workflowOrchestrator.recordError(session, "Could not parse request. Use format: 'hw 17 from cs 170' or 'cs 170 hw 17'");
+          return {
+            content: [{ type: "text", text: `Error: Could not parse request. Use format like:\n- "hw 17 from cs 170"\n- "complete lab 3 for eecs 16a"\n- "cs 170 homework 17"\n\nSession ID: ${session.id}` }],
+          };
+        }
+
+        // Find the course
+        const courses = await canvasClient.getCourses();
+        const courseMatch = workflowOrchestrator.findCourse(courses, courseQuery);
+
+        if (!courseMatch) {
+          workflowOrchestrator.recordError(session, `Could not find course matching "${courseQuery}"`);
+          const availableCourses = courses.slice(0, 5).map(c => `- ${c.name} (${c.course_code})`).join("\n");
+          return {
+            content: [{ type: "text", text: `Error: Could not find course matching "${courseQuery}"\n\nAvailable courses:\n${availableCourses}\n\nSession ID: ${session.id}` }],
+          };
+        }
+
+        workflowOrchestrator.setCourse(session, courseMatch.course, courseMatch.confidence);
+
+        // Find the assignment
+        const assignments = await canvasClient.getAssignments(courseMatch.course.id);
+        const assignmentMatch = workflowOrchestrator.findAssignment(assignments, assignmentQuery);
+
+        if (!assignmentMatch) {
+          workflowOrchestrator.recordError(session, `Could not find assignment matching "${assignmentQuery}"`);
+          const availableAssignments = assignments.slice(0, 10).map(a => `- ${a.name}`).join("\n");
+          return {
+            content: [{ type: "text", text: `Error: Could not find assignment matching "${assignmentQuery}" in ${courseMatch.course.name}\n\nAvailable assignments:\n${availableAssignments}\n\nSession ID: ${session.id}` }],
+          };
+        }
+
+        workflowOrchestrator.setAssignment(session, assignmentMatch.assignment, assignmentMatch.confidence);
+
+        // Get full assignment details and analyze
+        const fullAssignment = await canvasClient.getAssignment(courseMatch.course.id, assignmentMatch.assignment.id);
+        const analysis = assignmentAnalyzer.analyze(fullAssignment, courseMatch.course.id);
+        workflowOrchestrator.setAnalysis(session, analysis);
+
+        if (!analysis.automatable) {
+          workflowOrchestrator.recordError(session, `Assignment cannot be automated: ${analysis.automatableReason}`);
+          return {
+            content: [{ type: "text", text: `Error: This assignment cannot be automated.\nReason: ${analysis.automatableReason}\n\nSession ID: ${session.id}` }],
+          };
+        }
+
+        // Prepare solution context and prompt
+        const context = solutionGenerator.prepareContext(analysis);
+        const prompt = solutionGenerator.generatePrompt(context);
+        workflowOrchestrator.setSolutionContext(session, context, prompt);
+
+        // Return the prompt for Claude to generate the solution
+        const response = [
+          `✓ Workflow started: ${session.id}`,
+          ``,
+          `**Course:** ${courseMatch.course.name} (confidence: ${courseMatch.confidence}%)`,
+          `**Assignment:** ${assignmentMatch.assignment.name} (confidence: ${assignmentMatch.confidence}%)`,
+          `**Type:** ${analysis.type}`,
+          `**Due:** ${assignmentMatch.assignment.due_at ? new Date(assignmentMatch.assignment.due_at).toLocaleString() : "No due date"}`,
+          ``,
+          `---`,
+          ``,
+          prompt,
+          ``,
+          `---`,
+          ``,
+          `**Next step:** Generate the solution based on the prompt above, then call save_and_review with session_id="${session.id}" and the generated content.`,
+        ].join("\n");
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "save_and_review": {
+        const { session_id, content } = args as { session_id: string; content: string };
+
+        const session = workflowOrchestrator.getSession(session_id);
+        if (!session) {
+          return {
+            content: [{ type: "text", text: `Error: Session ${session_id} not found` }],
+          };
+        }
+
+        if (!session.canvasAssignment || !session.solutionContext) {
+          return {
+            content: [{ type: "text", text: `Error: Session ${session_id} is incomplete. Use start_assignment first.` }],
+          };
+        }
+
+        // Save the draft
+        const draft = solutionGenerator.saveDraft(
+          session.canvasAssignment.id,
+          session.canvasCourse!.id,
+          session.canvasAssignment.name,
+          content,
+          session.solutionContext.format
+        );
+
+        workflowOrchestrator.setDraft(session, draft);
+
+        const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+
+        const response = [
+          `✓ Draft saved for review`,
+          ``,
+          `**Session:** ${session.id}`,
+          `**Assignment:** ${session.canvasAssignment.name}`,
+          `**Format:** ${draft.format}`,
+          `**Word Count:** ${wordCount}`,
+          `**Status:** ${draft.status}`,
+          ``,
+          `--- Content Preview (first 1000 chars) ---`,
+          ``,
+          content.substring(0, 1000) + (content.length > 1000 ? "\n\n... [truncated]" : ""),
+          ``,
+          `---`,
+          ``,
+          `**Review the content above.** When ready:`,
+          `- To approve and submit: call approve_draft then submit_assignment with session_id="${session.id}"`,
+          `- To revise: call save_and_review again with updated content`,
+          `- To cancel: no action needed`,
+        ].join("\n");
+
+        return {
+          content: [{ type: "text", text: response }],
+        };
+      }
+
+      case "submit_assignment": {
+        const { session_id, file_path } = args as { session_id: string; file_path?: string };
+
+        const session = workflowOrchestrator.getSession(session_id);
+        if (!session) {
+          return {
+            content: [{ type: "text", text: `Error: Session ${session_id} not found` }],
+          };
+        }
+
+        if (!session.draft) {
+          return {
+            content: [{ type: "text", text: `Error: No draft found for session ${session_id}. Use save_and_review first.` }],
+          };
+        }
+
+        if (session.draft.status !== "approved") {
+          return {
+            content: [{ type: "text", text: `Error: Draft must be approved before submission. Current status: ${session.draft.status}\n\nCall approve_draft first with session_id="${session_id}"` }],
+          };
+        }
+
+        // Check for Gradescope mapping
+        const courseMapping = courseMapper.getMappingForCanvasCourse(session.canvasCourse!.id);
+        if (!courseMapping) {
+          return {
+            content: [{ type: "text", text: `Error: No Gradescope course mapping found for ${session.canvasCourse!.name}. Run auto_match_courses first.` }],
+          };
+        }
+
+        // If file_path provided, write content to file
+        let uploadPath = file_path;
+        if (!uploadPath && session.solutionContext?.format === "code") {
+          // Create temp file for code submissions
+          uploadPath = `/tmp/submission_${session_id}.txt`;
+          fs.writeFileSync(uploadPath, session.draft.content);
+          workflowOrchestrator.log(session, "submit_assignment", `Created temp file: ${uploadPath}`, {}, true);
+        } else if (!uploadPath) {
+          // For non-code, create a text file
+          uploadPath = `/tmp/submission_${session_id}.txt`;
+          fs.writeFileSync(uploadPath, session.draft.content);
+        }
+
+        // Find Gradescope assignment
+        const gsAssignments = await gradescopeClient.getAssignments(courseMapping.gradescopeCourseId);
+        const gsMatch = gsAssignments.find(a =>
+          a.name.toLowerCase().includes(session.canvasAssignment!.name.toLowerCase()) ||
+          session.canvasAssignment!.name.toLowerCase().includes(a.name.toLowerCase())
+        );
+
+        if (!gsMatch) {
+          return {
+            content: [{ type: "text", text: `Error: Could not find matching Gradescope assignment for "${session.canvasAssignment!.name}".\n\nFile saved at: ${uploadPath}\nYou can manually upload this file to Gradescope.` }],
+          };
+        }
+
+        // Submit to Gradescope
+        workflowOrchestrator.log(session, "submit_assignment", `Submitting to Gradescope assignment: ${gsMatch.name}`, {
+          gradescopeAssignmentId: gsMatch.id,
+        }, true);
+
+        const result = await gradescopeClient.uploadSubmission(
+          courseMapping.gradescopeCourseId,
+          gsMatch.id,
+          [uploadPath]
+        );
+
+        if (result.success) {
+          workflowOrchestrator.recordSubmission(session, result.url || "");
+          const doc = workflowOrchestrator.getDocumentation(session);
+
+          return {
+            content: [{ type: "text", text: `✓ Assignment submitted successfully!\n\n**Submission URL:** ${result.url}\n\n---\n\n${doc}` }],
+          };
+        } else {
+          workflowOrchestrator.recordError(session, result.error || "Unknown submission error");
+          return {
+            content: [{ type: "text", text: `Error submitting assignment: ${result.error}\n\nFile saved at: ${uploadPath}\nYou can manually upload this file.` }],
+          };
+        }
+      }
+
+      case "get_workflow_status": {
+        const { session_id } = args as { session_id: string };
+
+        const session = workflowOrchestrator.getSession(session_id);
+        if (!session) {
+          return {
+            content: [{ type: "text", text: `Error: Session ${session_id} not found` }],
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: workflowOrchestrator.getSummary(session) }],
+        };
+      }
+
+      case "list_workflows": {
+        const { active_only } = args as { active_only?: boolean };
+
+        const sessions = active_only
+          ? workflowOrchestrator.getActiveSessions()
+          : workflowOrchestrator.getAllSessions();
+
+        if (sessions.length === 0) {
+          return {
+            content: [{ type: "text", text: active_only ? "No active workflows" : "No workflows found" }],
+          };
+        }
+
+        const list = sessions.map(s => {
+          const age = Math.round((Date.now() - s.startedAt.getTime()) / 60000);
+          return `• ${s.id} [${s.status}] - "${s.originalRequest}" (${age}m ago)`;
+        }).join("\n");
+
+        return {
+          content: [{ type: "text", text: `=== Workflows (${sessions.length}) ===\n\n${list}` }],
+        };
+      }
+
+      case "get_workflow_documentation": {
+        const { session_id } = args as { session_id: string };
+
+        const session = workflowOrchestrator.getSession(session_id);
+        if (!session) {
+          return {
+            content: [{ type: "text", text: `Error: Session ${session_id} not found` }],
+          };
+        }
+
+        return {
+          content: [{ type: "text", text: workflowOrchestrator.getDocumentation(session) }],
         };
       }
 
