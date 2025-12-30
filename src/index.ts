@@ -68,6 +68,30 @@ class GradescopeClient {
     return token;
   }
 
+  async loginWithCookies(cookieString: string): Promise<boolean> {
+    const pairs = cookieString.split(";").map((s) => s.trim());
+    for (const pair of pairs) {
+      const match = pair.match(/^([^=]+)=(.*)$/);
+      if (match) {
+        const existing = this.cookies.findIndex((c) => c.name === match[1]);
+        if (existing >= 0) {
+          this.cookies[existing].value = match[2];
+        } else {
+          this.cookies.push({ name: match[1], value: match[2] });
+        }
+      }
+    }
+    const response = await fetch(`${GRADESCOPE_BASE_URL}/account`, {
+      headers: { Cookie: this.getCookieHeader() },
+      redirect: "manual",
+    });
+    if (response.status === 200) {
+      this.loggedIn = true;
+      return true;
+    }
+    return false;
+  }
+
   async login(email: string, password: string): Promise<boolean> {
     const authToken = await this.getAuthToken();
 
@@ -289,6 +313,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "gradescope_login_with_cookies",
+      description:
+        "Login to Gradescope using browser cookies. Get cookies from browser DevTools: Application > Cookies > gradescope.com. Copy the cookie string (especially _gradescope_session and signed_token).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cookies: {
+            type: "string",
+            description:
+              "Cookie string from browser, format: name1=value1; name2=value2",
+          },
+        },
+        required: ["cookies"],
+      },
+    },
+    {
       name: "gradescope_get_courses",
       description: "Get all courses for the logged in user",
       inputSchema: { type: "object", properties: {} },
@@ -339,6 +379,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: success
                 ? "Successfully logged in to Gradescope"
                 : "Login failed - check credentials",
+            },
+          ],
+        };
+      }
+
+      case "gradescope_login_with_cookies": {
+        const { cookies } = args as { cookies: string };
+        const success = await client.loginWithCookies(cookies);
+        return {
+          content: [
+            {
+              type: "text",
+              text: success
+                ? "Successfully logged in to Gradescope with cookies"
+                : "Login failed - cookies may be expired or invalid",
             },
           ],
         };
