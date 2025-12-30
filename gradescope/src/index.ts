@@ -298,7 +298,7 @@ async function autoLogin() {
   const signedToken = process.env.GRADESCOPE_TOKEN;
   if (sessionCookie && signedToken) {
     const cookieString = `_gradescope_session=${sessionCookie}; signed_token=${signedToken}`;
-    await client.loginWithCookies(cookieString);
+    await gradescopeClient.loginWithCookies(cookieString);
   }
 }
 
@@ -492,7 +492,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "gradescope_login_with_cookies": {
         const { cookies } = args as { cookies: string };
-        const success = await client.loginWithCookies(cookies);
+        const success = await gradescopeClient.loginWithCookies(cookies);
         return {
           content: [
             {
