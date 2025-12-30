@@ -132,10 +132,9 @@ class GradescopeClient {
   async uploadSubmission(courseId, assignmentId, filePaths) {
     if (!this.loggedIn) throw new Error('Not logged in');
 
-    const courseUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}`;
     const assignmentUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}`;
 
-    // First, check the assignment page to get CSRF token and detect existing submission
+    // First, check the assignment page to get CSRF token
     const assignmentResponse = await fetch(assignmentUrl, {
       headers: { Cookie: this.getCookieHeader() },
       redirect: 'follow',
@@ -144,30 +143,15 @@ class GradescopeClient {
     const $ = cheerio.load(assignmentHtml);
     const authToken = $('meta[name="csrf-token"]').attr('content') || '';
 
-    // Check if there's an existing submission by looking at the final URL or form action
-    const finalAssignmentUrl = assignmentResponse.url;
-    const existingSubmissionMatch = finalAssignmentUrl.match(/\/submissions\/(\d+)/);
-
-    // Extract resubmit_path from the JSON data embedded in the page
-    const decoded = assignmentHtml.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-    const resubmitPathMatch = decoded.match(/"resubmit_path":"([^"]+)"/);
-
-    let uploadUrl;
-    if (resubmitPathMatch) {
-      uploadUrl = `${GRADESCOPE_BASE_URL}${resubmitPathMatch[1]}`;
-      console.log('Using resubmit_path from JSON:', uploadUrl);
-    } else if (existingSubmissionMatch) {
-      // Fallback: use the submissions endpoint
-      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
-      console.log('Using submissions URL (fallback):', uploadUrl);
-    } else {
-      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
-      console.log('Using new submission URL:', uploadUrl);
-    }
+    // The resubmit URL is always /submissions
+    const uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
+    const refererUrl = assignmentResponse.url;
 
     const form = new FormData();
     form.append('utf8', '✓');
     form.append('authenticity_token', authToken);
+    form.append('submission[method]', 'upload');
+    form.append('submission[leaderboard_name]', '');
 
     for (const filePath of filePaths) {
       const absolutePath = path.resolve(filePath);
@@ -176,40 +160,40 @@ class GradescopeClient {
       }
       const fileStream = fs.createReadStream(absolutePath);
       const fileName = path.basename(absolutePath);
-      // Use 'files[]' - Rails array convention
-      form.append('files[]', fileStream, fileName);
+      form.append('submission[files][]', fileStream, fileName);
     }
 
     const response = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
         Cookie: this.getCookieHeader(),
-        Referer: finalAssignmentUrl,  // Use the actual submission page URL as referer
-        'Accept': 'application/json',
-        'Cache-Control': 'no-cache',
-        'Origin': 'https://www.gradescope.com',
+        Accept: 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
+        Origin: GRADESCOPE_BASE_URL,
+        Referer: refererUrl,
         ...form.getHeaders(),
       },
       body: form,
       redirect: 'follow',
     });
 
-    const finalUrl = response.url;
     const responseText = await response.text();
-
     console.log('Response status:', response.status);
-    console.log('Final URL:', finalUrl);
-    console.log('Response body (first 2000 chars):', responseText.substring(0, 2000));
+    console.log('Response body:', responseText.substring(0, 500));
 
-    if (finalUrl === courseUrl || finalUrl.endsWith('submissions')) {
-      return {
-        success: false,
-        error: 'Upload failed - possibly past due date or invalid submission',
-      };
+    try {
+      const jsonResponse = JSON.parse(responseText);
+      if (jsonResponse.success) {
+        const submissionUrl = jsonResponse.url
+          ? (jsonResponse.url.startsWith('http') ? jsonResponse.url : `${GRADESCOPE_BASE_URL}${jsonResponse.url}`)
+          : response.url;
+        return { success: true, url: submissionUrl };
+      } else {
+        return { success: false, error: jsonResponse.error || 'Upload failed' };
+      }
+    } catch {
+      return { success: false, error: `Upload failed - status ${response.status}` };
     }
-
-    return { success: true, url: finalUrl };
   }
 }
 

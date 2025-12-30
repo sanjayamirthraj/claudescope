@@ -7,7 +7,6 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import * as cheerio from "cheerio";
-import FormData from "form-data";
 import fs from "fs";
 import path from "path";
 
@@ -59,6 +58,29 @@ class GradescopeClient {
         }
       }
     }
+  }
+
+  private getMimeType(filename: string): string {
+    const ext = filename.toLowerCase().split(".").pop() || "";
+    const mimeTypes: Record<string, string> = {
+      pdf: "application/pdf",
+      txt: "text/plain",
+      py: "text/x-python",
+      java: "text/x-java",
+      cpp: "text/x-c++src",
+      c: "text/x-csrc",
+      h: "text/x-chdr",
+      js: "application/javascript",
+      ts: "application/typescript",
+      json: "application/json",
+      zip: "application/zip",
+      tar: "application/x-tar",
+      gz: "application/gzip",
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+    };
+    return mimeTypes[ext] || "application/octet-stream";
   }
 
   private async getAuthToken(): Promise<string> {
@@ -413,31 +435,19 @@ class GradescopeClient {
     const $ = cheerio.load(assignmentHtml);
     const authToken = $('meta[name="csrf-token"]').attr("content") || "";
 
-    // Check if there's an existing submission by looking at the final URL or form action
-    // When you have a submission, you get redirected to /submissions/{id}
-    const finalAssignmentUrl = assignmentResponse.url;
-    const existingSubmissionMatch = finalAssignmentUrl.match(/\/submissions\/(\d+)/);
+    // The resubmit URL is always /submissions (not /submissions/{id})
+    // Gradescope handles creating new submissions vs resubmissions automatically
+    const uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
 
-    // Also check for form action in the modal (for programming assignments)
-    let uploadUrl: string;
-    const formAction = $('form.js-submitCodeForm').attr('action') ||
-                       $('form[action*="submissions"]').attr('action');
+    // Use the final URL (which may be a submission page) as the referer
+    const refererUrl = assignmentResponse.url;
 
-    if (formAction && formAction.includes('/submissions/')) {
-      // Use the form action URL (has the submission ID for resubmission)
-      uploadUrl = formAction.startsWith('http') ? formAction : `${GRADESCOPE_BASE_URL}${formAction}`;
-    } else if (existingSubmissionMatch) {
-      // Resubmit to existing submission
-      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions/${existingSubmissionMatch[1]}`;
-    } else {
-      // New submission
-      uploadUrl = `${GRADESCOPE_BASE_URL}/courses/${courseId}/assignments/${assignmentId}/submissions`;
-    }
-
-    const form = new FormData();
-    form.append("utf8", "✓");
-    form.append("authenticity_token", authToken);
-    form.append("submission[method]", "upload");
+    // Use native FormData (Node.js 18+)
+    const formData = new FormData();
+    formData.append("utf8", "✓");
+    formData.append("authenticity_token", authToken);
+    formData.append("submission[method]", "upload");
+    formData.append("submission[leaderboard_name]", "");
 
     // Handle file paths (files on local filesystem)
     if (filePaths && filePaths.length > 0) {
@@ -446,9 +456,11 @@ class GradescopeClient {
         if (!fs.existsSync(absolutePath)) {
           return { success: false, error: `File not found: ${filePath}` };
         }
-        const fileStream = fs.createReadStream(absolutePath);
+        const fileContent = fs.readFileSync(absolutePath);
         const fileName = path.basename(absolutePath);
-        form.append("submission[files][]", fileStream, fileName);
+        const mimeType = this.getMimeType(fileName);
+        const blob = new Blob([fileContent], { type: mimeType });
+        formData.append("submission[files][]", blob, fileName);
       }
     }
 
@@ -456,10 +468,9 @@ class GradescopeClient {
     if (fileContents && fileContents.length > 0) {
       for (const file of fileContents) {
         const buffer = Buffer.from(file.content, "utf-8");
-        form.append("submission[files][]", buffer, {
-          filename: file.filename,
-          contentType: "application/octet-stream",
-        });
+        const mimeType = this.getMimeType(file.filename);
+        const blob = new Blob([buffer], { type: mimeType });
+        formData.append("submission[files][]", blob, file.filename);
       }
     }
 
@@ -467,22 +478,42 @@ class GradescopeClient {
       method: "POST",
       headers: {
         Cookie: this.getCookieHeader(),
-        Referer: assignmentUrl,
-        ...form.getHeaders(),
+        Accept: "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        Origin: GRADESCOPE_BASE_URL,
+        Referer: refererUrl,
       },
-      body: form as unknown as BodyInit,
+      body: formData,
       redirect: "follow",
     });
 
-    const finalUrl = response.url;
-    if (finalUrl === courseUrl || finalUrl.endsWith("submissions")) {
+    // Parse response - Gradescope returns JSON on success
+    const responseText = await response.text();
+
+    try {
+      const jsonResponse = JSON.parse(responseText);
+      if (jsonResponse.success) {
+        const submissionUrl = jsonResponse.url
+          ? (jsonResponse.url.startsWith("http") ? jsonResponse.url : `${GRADESCOPE_BASE_URL}${jsonResponse.url}`)
+          : response.url;
+        return { success: true, url: submissionUrl };
+      } else {
+        return {
+          success: false,
+          error: jsonResponse.error || "Upload failed - server returned unsuccessful response"
+        };
+      }
+    } catch {
+      // Non-JSON response - check by URL
+      const finalUrl = response.url;
+      if (response.ok && finalUrl.includes("/submissions/")) {
+        return { success: true, url: finalUrl };
+      }
       return {
         success: false,
-        error: "Upload failed - possibly past due date or invalid submission",
+        error: `Upload failed - status ${response.status}: ${responseText.substring(0, 200)}`,
       };
     }
-
-    return { success: true, url: finalUrl };
   }
 }
 
