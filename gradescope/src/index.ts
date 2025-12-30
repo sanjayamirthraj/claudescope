@@ -30,6 +30,14 @@ interface Cookie {
   value: string;
 }
 
+interface Grade {
+  assignmentId: string;
+  assignmentName: string;
+  score: string;
+  maxScore: string;
+  status: string;
+}
+
 class GradescopeClient {
   private cookies: Cookie[] = [];
   private loggedIn = false;
@@ -236,6 +244,51 @@ class GradescopeClient {
     return assignments;
   }
 
+  async getGrades(courseId: string): Promise<Grade[]> {
+    if (!this.loggedIn) throw new Error("Not logged in");
+
+    const response = await fetch(
+      `${GRADESCOPE_BASE_URL}/courses/${courseId}`,
+      { headers: { Cookie: this.getCookieHeader() } }
+    );
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    const grades: Grade[] = [];
+
+    $("table tbody tr, .assignmentTable--row").each((_, row) => {
+      const $row = $(row);
+      const $link = $row.find("a").first();
+      const href = $link.attr("href") || "";
+      const idMatch = href.match(/\/assignments\/(\d+)/);
+      if (!idMatch) return;
+
+      const assignmentId = idMatch[1];
+      const assignmentName = $link.text().trim();
+      if (!assignmentName) return;
+
+      let score = "";
+      let maxScore = "";
+      let status = "";
+
+      $row.find("td").each((_, cell) => {
+        const cellText = $(cell).text().trim();
+        const scoreMatch = cellText.match(/^([\d.]+)\s*\/\s*([\d.]+)$/);
+        if (scoreMatch) {
+          score = scoreMatch[1];
+          maxScore = scoreMatch[2];
+        }
+        if (cellText === "Submitted" || cellText === "Graded" || cellText === "No Submission" || cellText.includes("Ungraded")) {
+          status = cellText;
+        }
+      });
+
+      grades.push({ assignmentId, assignmentName, score, maxScore, status });
+    });
+
+    return grades;
+  }
+
   async uploadSubmission(
     courseId: string,
     assignmentId: string,
@@ -317,7 +370,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     // Gradescope tools
     {
       name: "gradescope_login",
-      description: "Login to Gradescope with email and password",
+      description: "Login to Gradescope with email and password (for non-SSO accounts)",
       inputSchema: {
         type: "object",
         properties: {
@@ -330,14 +383,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "gradescope_login_with_cookies",
       description:
-        "Login to Gradescope using browser cookies. Get cookies from browser DevTools: Application > Cookies > gradescope.com. Copy the cookie string (especially _gradescope_session and signed_token).",
+        "Login to Gradescope using browser cookies (for SSO/CalNet users). Get cookies from browser DevTools: Application > Cookies > gradescope.com",
       inputSchema: {
         type: "object",
         properties: {
           cookies: {
             type: "string",
             description:
-              "Cookie string from browser, format: name1=value1; name2=value2",
+              "Cookie string from browser, format: _gradescope_session=xxx; signed_token=yyy",
           },
         },
         required: ["cookies"],
@@ -351,6 +404,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "gradescope_get_assignments",
       description: "Get all assignments for a specific course",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "string", description: "The course ID" },
+        },
+        required: ["course_id"],
+      },
+    },
+    {
+      name: "gradescope_get_grades",
+      description: "Get grades for all assignments in a course",
       inputSchema: {
         type: "object",
         properties: {
@@ -628,6 +692,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             { type: "text", text: JSON.stringify(assignments, null, 2) },
           ],
+        };
+      }
+
+      case "gradescope_get_grades": {
+        const { course_id } = args as { course_id: string };
+        const grades = await gradescopeClient.getGrades(course_id);
+        return {
+          content: [{ type: "text", text: JSON.stringify(grades, null, 2) }],
         };
       }
 
