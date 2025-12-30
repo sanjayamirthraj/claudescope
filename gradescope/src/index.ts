@@ -15,6 +15,7 @@ import path from "path";
 import {
   CanvasClient,
   CourseMapper,
+  AssignmentAnalyzer,
   CanvasCourse,
   GradescopeCourse,
   GradescopeAssignment,
@@ -292,6 +293,7 @@ class GradescopeClient {
 const gradescopeClient = new GradescopeClient();
 const canvasClient = new CanvasClient();
 const courseMapper = new CourseMapper();
+const assignmentAnalyzer = new AssignmentAnalyzer();
 
 async function autoLogin() {
   const sessionCookie = process.env.GRADESCOPE_SESSION;
@@ -464,6 +466,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           canvas_course_id: { type: "number", description: "The Canvas course ID" },
         },
         required: ["canvas_course_id"],
+      },
+    },
+    // Assignment analyzer tools
+    {
+      name: "analyze_assignment",
+      description: "Analyze a Canvas assignment to extract requirements, determine type, and check if it can be automated",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+          assignment_id: { type: "number", description: "The Canvas assignment ID" },
+        },
+        required: ["course_id", "assignment_id"],
+      },
+    },
+    {
+      name: "analyze_course_assignments",
+      description: "Analyze all assignments in a Canvas course to identify which can be automated",
+      inputSchema: {
+        type: "object",
+        properties: {
+          course_id: { type: "number", description: "The Canvas course ID" },
+        },
+        required: ["course_id"],
       },
     },
   ],
@@ -713,6 +739,71 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const mappings = courseMapper.getAssignmentMappings(canvas_course_id);
         return {
           content: [{ type: "text", text: JSON.stringify(mappings, null, 2) }],
+        };
+      }
+
+      // Assignment analyzer handlers
+      case "analyze_assignment": {
+        const { course_id, assignment_id } = args as {
+          course_id: number;
+          assignment_id: number;
+        };
+
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas" }],
+          };
+        }
+
+        const assignment = await canvasClient.getAssignment(course_id, assignment_id);
+        const analysis = assignmentAnalyzer.analyze(assignment, course_id);
+        const summary = assignmentAnalyzer.summarize(analysis);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: summary + "\n\n--- Full Analysis ---\n" + JSON.stringify(analysis, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "analyze_course_assignments": {
+        const { course_id } = args as { course_id: number };
+
+        if (!canvasClient.isLoggedIn()) {
+          return {
+            content: [{ type: "text", text: "Error: Not logged in to Canvas" }],
+          };
+        }
+
+        const assignments = await canvasClient.getAssignments(course_id);
+        const analyses = assignments.map((a) => assignmentAnalyzer.analyze(a, course_id));
+
+        const automatable = analyses.filter((a) => a.automatable);
+        const notAutomatable = analyses.filter((a) => !a.automatable);
+
+        const summary = [
+          `=== Course Assignment Analysis ===`,
+          `Total assignments: ${analyses.length}`,
+          `Automatable: ${automatable.length}`,
+          `Not automatable: ${notAutomatable.length}`,
+          ``,
+          `--- Automatable Assignments ---`,
+          ...automatable.map((a) => `• ${a.name} (${a.type}) - ${a.automatableReason}`),
+          ``,
+          `--- Not Automatable ---`,
+          ...notAutomatable.map((a) => `• ${a.name} (${a.type}) - ${a.automatableReason}`),
+        ].join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: summary,
+            },
+          ],
         };
       }
 
